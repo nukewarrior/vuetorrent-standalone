@@ -2,7 +2,7 @@
 
 vuetorrent独立部署版
 
-DockerHub:[DockerHub:nukewarrior/vuetorrent-standalone]([https://github.com/nukewarrior/vuetorrent-standalone](https://hub.docker.com/r/nukecat/vuetorrent-standalone))  
+Docker镜像:[DockerHub:nukewarrior/vuetorrent-standalone](https://github.com/nukewarrior/vuetorrent-standalone)  
 VueTorrent项目地址:[GitHub:VueTorrent/VueTorrent](https://github.com/VueTorrent/VueTorrent)
 
 ```bash
@@ -25,7 +25,7 @@ nukecat/vuetorrent-standalone:latest
 
 A standalone version of VueTorrent. 
 
-DockerHub:[DockerHub:nukewarrior/vuetorrent-standalone]([https://github.com/nukewarrior/vuetorrent-standalone](https://hub.docker.com/r/nukecat/vuetorrent-standalone))  
+Docker Image:[DockerHub:nukewarrior/vuetorrent-standalone](https://github.com/nukewarrior/vuetorrent-standalone)  
 For more infomation about VueTorrent, see [GitHub:VueTorrent/VueTorrent](https://github.com/VueTorrent/VueTorrent)
 
 ```
