@@ -2,7 +2,7 @@
 
 [English](README_en.md)
 
-vuetorrent独立部署版
+vuetorrent独立部署版使用nginx容器作为反向代理，可以在不替换原因qbittorrent webui的情况下，独立使用vuetorrent。
 
 Docker镜像:[DockerHub:nukewarrior/vuetorrent-standalone](https://github.com/nukewarrior/vuetorrent-standalone)  
 VueTorrent项目地址:[GitHub:VueTorrent/VueTorrent](https://github.com/VueTorrent/VueTorrent)

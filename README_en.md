@@ -2,7 +2,7 @@
 
 [中文](README.md)
 
-A standalone version of VueTorrent.
+A standalone version of VueTorrent.Use nginx as a web server so you can use vuetorrent and qbittorrent's default webui same time.****
 
 Docker Image:[DockerHub:nukewarrior/vuetorrent-standalone](https://github.com/nukewarrior/vuetorrent-standalone)  
 For more infomation about VueTorrent, see [GitHub:VueTorrent/VueTorrent](https://github.com/VueTorrent/VueTorrent)
