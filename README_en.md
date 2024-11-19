@@ -22,6 +22,7 @@ nukecat/vuetorrent-standalone:latest
 2. Modify `8888` to your preferred port number, which is used to access vuetorrent.
 3. Set `QB_HOST` to the IP address or domain name of your qbittorrent container, for example, `https://my.domain.com`; don't forget to include `http://` or `https://`.
 4. Set `QB_PORT` to the port number used to access your qbittorrent container.
+5. Access vuetorrent and log in using your qbtorrent account and password.
 
 ## Build image yourself
 
@@ -34,3 +35,4 @@ nukecat/vuetorrent-standalone:latest
     ```
 
 4. run your image with `QB_HOST` and `QB_PORT` environment variables
+5. Access vuetorrent and log in using your qbtorrent account and password.
