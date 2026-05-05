@@ -1,0 +1,143 @@
+name: Build VueTorrent Docker image
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "VueTorrent release version, for example v2.33.0 or 2.33.0. Leave empty for latest."
+        required: false
+        type: string
+      force:
+        description: "Rebuild and push even when the Docker Hub version tag already exists."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vuetorrent-docker-release
+  cancel-in-progress: false
+
+env:
+  VUETORRENT_REPOSITORY: VueTorrent/VueTorrent
+  IMAGE_NAME: nukecat/vuetorrent-standalone
+
+jobs:
+  build:
+    name: Build and push Docker image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve VueTorrent release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ github.event.inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION}" ]; then
+            tag_name="${INPUT_VERSION}"
+            if [ "${tag_name#v}" = "${tag_name}" ]; then
+              tag_name="v${tag_name}"
+            fi
+
+            release_json="$(gh api "repos/${VUETORRENT_REPOSITORY}/releases/tags/${tag_name}")"
+          else
+            release_json="$(gh api "repos/${VUETORRENT_REPOSITORY}/releases/latest")"
+            tag_name="$(jq -r '.tag_name' <<< "${release_json}")"
+          fi
+
+          docker_tag="${tag_name#v}"
+          asset_url="$(
+            jq -r '.assets[] | select(.name == "vuetorrent.zip") | .browser_download_url' \
+              <<< "${release_json}" \
+              | head -n 1
+          )"
+
+          if [ -z "${asset_url}" ] || [ "${asset_url}" = "null" ]; then
+            echo "::error::Release ${tag_name} does not include vuetorrent.zip"
+            exit 1
+          fi
+
+          {
+            echo "tag_name=${tag_name}"
+            echo "docker_tag=${docker_tag}"
+            echo "asset_url=${asset_url}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Resolved VueTorrent ${tag_name}; Docker tag will be ${docker_tag}."
+
+      - name: Check whether Docker tag already exists
+        id: docker_tag
+        env:
+          DOCKER_TAG: ${{ steps.release.outputs.docker_tag }}
+          FORCE: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+
+          if [ "${FORCE}" = "true" ]; then
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+            echo "Force rebuild requested."
+            exit 0
+          fi
+
+          status_code="$(
+            curl \
+              --silent \
+              --output /dev/null \
+              --write-out "%{http_code}" \
+              "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${DOCKER_TAG}"
+          )"
+
+          if [ "${status_code}" = "200" ]; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "Docker tag ${IMAGE_NAME}:${DOCKER_TAG} already exists; skipping build."
+          elif [ "${status_code}" = "404" ]; then
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+            echo "Docker tag ${IMAGE_NAME}:${DOCKER_TAG} does not exist yet."
+          else
+            echo "::error::Unexpected Docker Hub response while checking ${IMAGE_NAME}:${DOCKER_TAG}: HTTP ${status_code}"
+            exit 1
+          fi
+
+      - name: Download VueTorrent release asset
+        if: steps.docker_tag.outputs.exists != 'true'
+        env:
+          ASSET_URL: ${{ steps.release.outputs.asset_url }}
+        run: |
+          set -euo pipefail
+
+          curl --fail --location --output vuetorrent.zip "${ASSET_URL}"
+          rm -rf vuetorrent
+          unzip -q vuetorrent.zip
+          test -d vuetorrent/public
+
+      - name: Set up Docker Buildx
+        if: steps.docker_tag.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: steps.docker_tag.outputs.exists != 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        if: steps.docker_tag.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.release.outputs.docker_tag }}
+            ${{ env.IMAGE_NAME }}:latest
