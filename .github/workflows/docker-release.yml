@@ -2,7 +2,7 @@ name: Build VueTorrent Docker image
 
 on:
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       version:
@@ -43,39 +43,149 @@ jobs:
         run: |
           set -euo pipefail
 
+          fetch_release() {
+            local endpoint="$1"
+            local response=""
+            local error_file
+            error_file="$(mktemp)"
+
+            for attempt in 1 2 3; do
+              if response="$(gh api "${endpoint}" 2>"${error_file}")"; then
+                rm -f "${error_file}"
+                printf '%s' "${response}"
+                return 0
+              fi
+
+              echo "::warning::GitHub API request failed for ${endpoint} (attempt ${attempt}/3)." >&2
+              cat "${error_file}" >&2 || true
+
+              if [ "${attempt}" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
+            done
+
+            rm -f "${error_file}"
+            return 1
+          }
+
+          strict=false
+
           if [ -n "${INPUT_VERSION}" ]; then
+            strict=true
             tag_name="${INPUT_VERSION}"
+
             if [ "${tag_name#v}" = "${tag_name}" ]; then
               tag_name="v${tag_name}"
             fi
 
-            release_json="$(gh api "repos/${VUETORRENT_REPOSITORY}/releases/tags/${tag_name}")"
+            release_endpoint="repos/${VUETORRENT_REPOSITORY}/releases/tags/${tag_name}"
+
+            if ! release_json="$(fetch_release "${release_endpoint}")"; then
+              echo "::error::Unable to query VueTorrent release ${tag_name}."
+              exit 1
+            fi
           else
-            release_json="$(gh api "repos/${VUETORRENT_REPOSITORY}/releases/latest")"
-            tag_name="$(jq -r '.tag_name' <<< "${release_json}")"
+            if ! release_json="$(fetch_release "repos/${VUETORRENT_REPOSITORY}/releases/latest")"; then
+              echo "::error::Unable to query the latest VueTorrent release."
+              exit 1
+            fi
+
+            tag_name="$(jq -r '.tag_name // empty' <<< "${release_json}")"
+
+            if [ -z "${tag_name}" ]; then
+              echo "::error::Latest VueTorrent release did not contain a tag_name."
+              exit 1
+            fi
+
+            # Pin subsequent polling to the release we resolved, so a newly
+            # published release cannot change the target midway through this run.
+            release_endpoint="repos/${VUETORRENT_REPOSITORY}/releases/tags/${tag_name}"
+          fi
+
+          asset_url=""
+          asset_digest=""
+
+          # A GitHub release can become visible shortly before its assets finish
+          # uploading. Give the upstream release a brief grace period.
+          for attempt in 1 2 3; do
+            asset_url="$(
+              jq -r '
+                .assets[]
+                | select(
+                    .name == "vuetorrent.zip"
+                    and .state == "uploaded"
+                    and .size > 0
+                  )
+                | .browser_download_url
+              ' <<< "${release_json}" | head -n 1
+            )"
+
+            asset_digest="$(
+              jq -r '
+                .assets[]
+                | select(
+                    .name == "vuetorrent.zip"
+                    and .state == "uploaded"
+                    and .size > 0
+                  )
+                | (.digest // "")
+              ' <<< "${release_json}" | head -n 1
+            )"
+
+            if [ -n "${asset_url}" ] && [ "${asset_url}" != "null" ]; then
+              break
+            fi
+
+            if [ "${attempt}" -lt 3 ]; then
+              echo "::notice::Release ${tag_name} does not have a ready vuetorrent.zip yet; checking again in 20 seconds."
+              sleep 20
+
+              if ! release_json="$(fetch_release "${release_endpoint}")"; then
+                echo "::error::Unable to refresh VueTorrent release ${tag_name}."
+                exit 1
+              fi
+            fi
+          done
+
+          if [ -z "${asset_url}" ] || [ "${asset_url}" = "null" ]; then
+            if [ "${strict}" = "true" ]; then
+              echo "::error::Release ${tag_name} does not include a ready vuetorrent.zip asset."
+              exit 1
+            fi
+
+            echo "ready=false" >> "${GITHUB_OUTPUT}"
+            echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
+            echo "::notice::Latest release ${tag_name} does not include a ready vuetorrent.zip asset; skipping this scheduled run."
+            exit 0
           fi
 
           docker_tag="${tag_name#v}"
-          asset_url="$(
-            jq -r '.assets[] | select(.name == "vuetorrent.zip") | .browser_download_url' \
-              <<< "${release_json}" \
-              | head -n 1
-          )"
-
-          if [ -z "${asset_url}" ] || [ "${asset_url}" = "null" ]; then
-            echo "::error::Release ${tag_name} does not include vuetorrent.zip"
-            exit 1
-          fi
 
           {
+            echo "ready=true"
             echo "tag_name=${tag_name}"
             echo "docker_tag=${docker_tag}"
             echo "asset_url=${asset_url}"
+            echo "asset_digest=${asset_digest}"
           } >> "${GITHUB_OUTPUT}"
 
           echo "Resolved VueTorrent ${tag_name}; Docker tag will be ${docker_tag}."
 
+      - name: Summarize unavailable release
+        if: steps.release.outputs.ready != 'true'
+        env:
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+        run: |
+          {
+            echo "### Build skipped"
+            echo
+            echo "VueTorrent \`${TAG_NAME}\` is the latest release, but its \`vuetorrent.zip\` asset is not ready."
+            echo
+            echo "The scheduled workflow will check again automatically."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Check whether Docker tag already exists
+        if: steps.release.outputs.ready == 'true'
         id: docker_tag
         env:
           DOCKER_TAG: ${{ steps.release.outputs.docker_tag }}
@@ -89,13 +199,26 @@ jobs:
             exit 0
           fi
 
-          status_code="$(
-            curl \
-              --silent \
-              --output /dev/null \
-              --write-out "%{http_code}" \
-              "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${DOCKER_TAG}"
-          )"
+          status_code=""
+
+          for attempt in 1 2 3; do
+            set +e
+            status_code="$(
+              curl                 --silent                 --show-error                 --output /dev/null                 --write-out "%{http_code}"                 --connect-timeout 10                 --max-time 30                 "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${DOCKER_TAG}"
+            )"
+            curl_exit=$?
+            set -e
+
+            if [ "${curl_exit}" -eq 0 ] && { [ "${status_code}" = "200" ] || [ "${status_code}" = "404" ]; }; then
+              break
+            fi
+
+            echo "::warning::Docker Hub tag lookup failed for ${IMAGE_NAME}:${DOCKER_TAG} (attempt ${attempt}/3, curl=${curl_exit}, HTTP=${status_code:-unknown})."
+
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
 
           if [ "${status_code}" = "200" ]; then
             echo "exists=true" >> "${GITHUB_OUTPUT}"
@@ -104,41 +227,66 @@ jobs:
             echo "exists=false" >> "${GITHUB_OUTPUT}"
             echo "Docker tag ${IMAGE_NAME}:${DOCKER_TAG} does not exist yet."
           else
-            echo "::error::Unexpected Docker Hub response while checking ${IMAGE_NAME}:${DOCKER_TAG}: HTTP ${status_code}"
+            echo "::error::Unable to reliably check Docker tag ${IMAGE_NAME}:${DOCKER_TAG}; last HTTP status was ${status_code:-unknown}."
             exit 1
           fi
 
-      - name: Download VueTorrent release asset
-        if: steps.docker_tag.outputs.exists != 'true'
+      - name: Summarize existing Docker image
+        if: steps.release.outputs.ready == 'true' && steps.docker_tag.outputs.exists == 'true'
+        env:
+          DOCKER_TAG: ${{ steps.release.outputs.docker_tag }}
+        run: |
+          {
+            echo "### Build skipped"
+            echo
+            echo "Docker image \`${IMAGE_NAME}:${DOCKER_TAG}\` already exists."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Download and verify VueTorrent release asset
+        if: steps.release.outputs.ready == 'true' && steps.docker_tag.outputs.exists != 'true'
         env:
           ASSET_URL: ${{ steps.release.outputs.asset_url }}
+          ASSET_DIGEST: ${{ steps.release.outputs.asset_digest }}
         run: |
           set -euo pipefail
 
-          curl --fail --location --output vuetorrent.zip "${ASSET_URL}"
+          curl             --fail             --location             --retry 4             --retry-all-errors             --retry-delay 3             --connect-timeout 15             --max-time 180             --output vuetorrent.zip             "${ASSET_URL}"
+
+          test -s vuetorrent.zip
+
+          if [[ "${ASSET_DIGEST}" == sha256:* ]]; then
+            expected_sha256="${ASSET_DIGEST#sha256:}"
+            echo "${expected_sha256}  vuetorrent.zip" | sha256sum --check -
+          else
+            echo "::warning::No SHA-256 digest was provided for vuetorrent.zip; skipping digest verification."
+          fi
+
+          unzip -tq vuetorrent.zip
+
           rm -rf vuetorrent
           unzip -q vuetorrent.zip
+
           test -d vuetorrent/public
 
       - name: Set up QEMU
-        if: steps.docker_tag.outputs.exists != 'true'
+        if: steps.release.outputs.ready == 'true' && steps.docker_tag.outputs.exists != 'true'
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
-        if: steps.docker_tag.outputs.exists != 'true'
+        if: steps.release.outputs.ready == 'true' && steps.docker_tag.outputs.exists != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: steps.docker_tag.outputs.exists != 'true'
+        if: steps.release.outputs.ready == 'true' && steps.docker_tag.outputs.exists != 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push Docker image
-        if: steps.docker_tag.outputs.exists != 'true'
+        if: steps.release.outputs.ready == 'true' && steps.docker_tag.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
